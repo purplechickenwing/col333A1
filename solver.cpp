@@ -7,7 +7,6 @@
 #include <cmath>
 #include <functional>
 
-
 using namespace std;
 
 // Structure to track village demands
@@ -58,10 +57,15 @@ double compute_objective(const Solution& sol, const ProblemData& problem,
             continue;
         }
         const auto& helicopter = problem.helicopters[plan.helicopter_id - 1];
+        double heli_total_dist = 0.0;
         for (const auto& trip : plan.trips) {
             double trip_dist = compute_trip_distance(trip, helicopter.home_city_id, problem, distances);
-            if (trip_dist <= 0) continue;
+            double trip_weight = compute_trip_weight(trip, problem);
+            if (trip_dist <= 0 || trip_weight > helicopter.weight_capacity + 1e-9 || trip_dist > helicopter.distance_capacity + 1e-9) {
+                continue;
+            }
             total_cost += helicopter.fixed_cost + helicopter.alpha * trip_dist;
+            heli_total_dist += trip_dist;
             for (const auto& drop : trip.drops) {
                 if (drop.village_id < 1 || drop.village_id > static_cast<int>(problem.villages.size())) {
                     continue;
@@ -71,6 +75,10 @@ double compute_objective(const Solution& sol, const ProblemData& problem,
                 std::get<1>(delivered[idx]) += drop.perishable_food;
                 std::get<2>(delivered[idx]) += drop.other_supplies;
             }
+        }
+        if (heli_total_dist > problem.d_max + 1e-9) {
+            // Penalize by ignoring this helicopter's contributions
+            continue;
         }
     }
 
@@ -208,10 +216,6 @@ Trip create_greedy_trip(const Helicopter& helicopter, std::vector<VillageDemand>
     if (drops.empty()) return trip;
 
     total_distance += distances[last_loc][home_city_id - 1];
-    if (total_distance > helicopter.distance_capacity || total_weight > helicopter.weight_capacity || total_distance <= 0) {
-        return trip;
-    }
-
     trip.drops = drops;
     trip.dry_food_pickup = 0;
     trip.perishable_food_pickup = 0;
@@ -223,6 +227,10 @@ Trip create_greedy_trip(const Helicopter& helicopter, std::vector<VillageDemand>
         if (drop.dry_food < 0 || drop.perishable_food < 0 || drop.other_supplies < 0) {
             return Trip{};
         }
+    }
+    double actual_weight = compute_trip_weight(trip, problem);
+    if (total_distance > helicopter.distance_capacity + 1e-9 || actual_weight > helicopter.weight_capacity + 1e-9 || total_distance <= 0) {
+        return Trip{};
     }
 
     return trip;
@@ -256,16 +264,20 @@ Solution generate_random_solution(const ProblemData& problem, std::mt19937& rng,
             trip.drops.clear();
 
             std::vector<int> village_ids;
+            int home_idx = helicopter.home_city_id - 1;
             for (size_t i = 0; i < problem.villages.size(); ++i) {
                 if (temp_demand[i].meals_needed > 0 || temp_demand[i].other_needed > 0) {
                     int village_id = problem.villages[i].id;
                     if (village_id < 1 || village_id > static_cast<int>(problem.villages.size())) continue;
-                    village_ids.push_back(village_id);
+                    double round_trip_dist = 2 * distances[home_idx][problem.cities.size() + i];
+                    if (round_trip_dist <= helicopter.distance_capacity) {
+                        village_ids.push_back(village_id);
+                    }
                 }
             }
             if (village_ids.empty()) continue;
             std::shuffle(village_ids.begin(), village_ids.end(), rng);
-            int max_villages = std::min<size_t>(3, village_ids.size());
+            int max_villages = std::min(static_cast<int>(village_ids.size()), 3);
             std::uniform_int_distribution<> num_villages_dist(1, max_villages);
             int num_villages = num_villages_dist(rng);
 
@@ -290,12 +302,43 @@ Solution generate_random_solution(const ProblemData& problem, std::mt19937& rng,
                     continue;
                 }
 
-                drop.dry_food = int(0.5 * drop.dry_food + 0.5 * (rng() % drop.dry_food)); // Random fraction
-                drop.perishable_food = int(0.5 * drop.perishable_food + 0.5 * (rng() % drop.perishable_food));
-                drop.other_supplies = int(0.5 * drop.other_supplies + 0.5 * (rng() % drop.other_supplies));
+                // Store full amounts before randomizing
+                int full_dry = drop.dry_food;
+                int full_peri = drop.perishable_food;
+                int full_o = drop.other_supplies;
 
-                temp_village_demand.meals_needed = std::max(0, temp_village_demand.meals_needed - (drop.dry_food + drop.perishable_food));
-                temp_village_demand.other_needed = std::max(0, temp_village_demand.other_needed - drop.other_supplies);
+                // Randomize to 1 to full if full > 0
+                if (full_dry > 0) {
+                    std::uniform_int_distribution<int> dist_d(1, full_dry);
+                    drop.dry_food = dist_d(rng);
+                }
+                if (full_peri > 0) {
+                    std::uniform_int_distribution<int> dist_p(1, full_peri);
+                    drop.perishable_food = dist_p(rng);
+                }
+                if (full_o > 0) {
+                    std::uniform_int_distribution<int> dist_o(1, full_o);
+                    drop.other_supplies = dist_o(rng);
+                }
+
+                // Check if after randomization still has some positive
+                if (drop.dry_food == 0 && drop.perishable_food == 0 && drop.other_supplies == 0) {
+                    // Adjust back to original since no delivery
+                    temp_village_demand.meals_needed += full_dry + full_peri;
+                    temp_village_demand.other_needed += full_o;
+                    continue;
+                }
+
+                // Adjust the demand: since allocate subtracted full, add back (full - random)
+                int used_meals = drop.dry_food + drop.perishable_food;
+                int used_o = drop.other_supplies;
+                temp_village_demand.meals_needed += (full_dry + full_peri - used_meals);
+                temp_village_demand.other_needed += (full_o - used_o);
+                temp_village_demand.meals_needed = std::max(0, temp_village_demand.meals_needed);
+                temp_village_demand.other_needed = std::max(0, temp_village_demand.other_needed);
+
+                // Update global temp_demand
+                temp_demand[village_id - 1] = temp_village_demand;
 
                 trip.drops.push_back(drop);
                 total_weight += drop.dry_food * problem.packages[0].weight +
@@ -307,16 +350,17 @@ Solution generate_random_solution(const ProblemData& problem, std::mt19937& rng,
 
             if (!trip.drops.empty()) {
                 total_distance += distances[last_loc][helicopter.home_city_id - 1];
-                if (total_distance <= helicopter.distance_capacity && 
-                    total_weight <= helicopter.weight_capacity && total_distance > 0) {
-                    trip.dry_food_pickup = 0;
-                    trip.perishable_food_pickup = 0;
-                    trip.other_supplies_pickup = 0;
-                    for (const auto& drop : trip.drops) {
-                        trip.dry_food_pickup += drop.dry_food;
-                        trip.perishable_food_pickup += drop.perishable_food;
-                        trip.other_supplies_pickup += drop.other_supplies;
-                    }
+                trip.dry_food_pickup = 0;
+                trip.perishable_food_pickup = 0;
+                trip.other_supplies_pickup = 0;
+                for (const auto& drop : trip.drops) {
+                    trip.dry_food_pickup += drop.dry_food;
+                    trip.perishable_food_pickup += drop.perishable_food;
+                    trip.other_supplies_pickup += drop.other_supplies;
+                }
+                double actual_weight = compute_trip_weight(trip, problem);
+                if (total_distance <= helicopter.distance_capacity + 1e-9 && 
+                    actual_weight <= helicopter.weight_capacity + 1e-9 && total_distance > 0) {
                     if (total_distance <= remaining_distance) {
                         plan.trips.push_back(trip);
                         remaining_distance -= total_distance;
@@ -342,29 +386,30 @@ Solution generate_neighbor(const Solution& sol, std::vector<VillageDemand>& dema
     if (h_idx < 0 || h_idx >= static_cast<int>(problem.helicopters.size())) {
         return neighbor;
     }
+    const auto& helicopter = problem.helicopters[h_idx];
 
     double total_dist = 0.0;
     for (const auto& trip : neighbor[h_idx].trips) {
-        total_dist += compute_trip_distance(trip, problem.helicopters[h_idx].home_city_id, problem, distances);
+        total_dist += compute_trip_distance(trip, helicopter.home_city_id, problem, distances);
     }
 
     std::uniform_int_distribution<> action_dist(0, 3);
     int action = action_dist(rng);
     if (action == 0 && total_dist < problem.d_max) {
         auto temp_demand = demand;
-        Trip trip = create_greedy_trip(problem.helicopters[h_idx], temp_demand, problem, distances);
-        if (!trip.drops.empty()) {
-            double trip_dist = compute_trip_distance(trip, problem.helicopters[h_idx].home_city_id, problem, distances);
-            if (trip_dist > 0 && total_dist + trip_dist <= problem.d_max) {
-                neighbor[h_idx].trips.push_back(trip);
+        Trip new_trip = create_greedy_trip(helicopter, temp_demand, problem, distances);
+        if (!new_trip.drops.empty()) {
+            double new_trip_dist = compute_trip_distance(new_trip, helicopter.home_city_id, problem, distances);
+            if (new_trip_dist > 0 && total_dist + new_trip_dist <= problem.d_max + 1e-9) {
+                neighbor[h_idx].trips.push_back(new_trip);
                 demand = temp_demand;
             }
         }
     } else if (action == 1 && !neighbor[h_idx].trips.empty()) {
         std::uniform_int_distribution<> trip_dist(0, neighbor[h_idx].trips.size() - 1);
         int t_idx = trip_dist(rng);
-        auto& trip = neighbor[h_idx].trips[t_idx];
-        for (const auto& drop : trip.drops) {
+        const auto& trip_to_remove = neighbor[h_idx].trips[t_idx];
+        for (const auto& drop : trip_to_remove.drops) {
             if (drop.village_id < 1 || drop.village_id > static_cast<int>(problem.villages.size())) continue;
             demand[drop.village_id - 1].meals_needed = std::max(
                 0, demand[drop.village_id - 1].meals_needed + drop.dry_food + drop.perishable_food
@@ -377,30 +422,29 @@ Solution generate_neighbor(const Solution& sol, std::vector<VillageDemand>& dema
     } else if (action == 2 && !neighbor[h_idx].trips.empty()) {
         std::uniform_int_distribution<> trip_dist(0, neighbor[h_idx].trips.size() - 1);
         int t_idx = trip_dist(rng);
-        auto& trip = neighbor[h_idx].trips[t_idx];
+        Trip& trip = neighbor[h_idx].trips[t_idx];
+        double old_dist = compute_trip_distance(trip, helicopter.home_city_id, problem, distances);
+        auto temp_demand = demand;
+        // Add back old deliveries to temp_demand for planning
         for (const auto& drop : trip.drops) {
             if (drop.village_id < 1 || drop.village_id > static_cast<int>(problem.villages.size())) continue;
-            demand[drop.village_id - 1].meals_needed = std::max(
-                0, demand[drop.village_id - 1].meals_needed + drop.dry_food + drop.perishable_food
-            );
-            demand[drop.village_id - 1].other_needed = std::max(
-                0, demand[drop.village_id - 1].other_needed + drop.other_supplies
-            );
+            int idx = drop.village_id - 1;
+            temp_demand[idx].meals_needed += drop.dry_food + drop.perishable_food;
+            temp_demand[idx].other_needed += drop.other_supplies;
         }
-        trip = create_greedy_trip(problem.helicopters[h_idx], demand, problem, distances);
-        if (!trip.drops.empty()) {
-            for (const auto& drop : trip.drops) {
-                if (drop.village_id < 1 || drop.village_id > static_cast<int>(problem.villages.size())) continue;
-                demand[drop.village_id - 1].meals_needed = std::max(
-                    0, demand[drop.village_id - 1].meals_needed - (drop.dry_food + drop.perishable_food)
-                );
-                demand[drop.village_id - 1].other_needed = std::max(
-                    0, demand[drop.village_id - 1].other_needed - drop.other_supplies
-                );
+        Trip new_trip = create_greedy_trip(helicopter, temp_demand, problem, distances);
+        double new_dist = compute_trip_distance(new_trip, helicopter.home_city_id, problem, distances);
+        double projected_total = total_dist - old_dist + new_dist;
+        if (!new_trip.drops.empty() && new_dist > 0 && projected_total <= problem.d_max + 1e-9) {
+            double new_weight = compute_trip_weight(new_trip, problem);
+            if (new_weight <= helicopter.weight_capacity + 1e-9 && new_dist <= helicopter.distance_capacity + 1e-9) {
+                // Update demand to reflect the replacement
+                demand = temp_demand;
+                // Replace the trip
+                trip = new_trip;
             }
-        } else {
-            neighbor[h_idx].trips.erase(neighbor[h_idx].trips.begin() + t_idx);
         }
+        // If not replaceable, do nothing
     } else if (action == 3 && neighbor[h_idx].trips.size() >= 2) {
         std::uniform_int_distribution<> trip_dist(0, neighbor[h_idx].trips.size() - 1);
         int t1_idx = trip_dist(rng);
@@ -411,19 +455,68 @@ Solution generate_neighbor(const Solution& sol, std::vector<VillageDemand>& dema
             std::uniform_int_distribution<> drop_dist2(0, neighbor[h_idx].trips[t2_idx].drops.size() - 1);
             int d1_idx = drop_dist1(rng);
             int d2_idx = drop_dist2(rng);
+            // Save originals before swap
+            const Drop& orig_drop1 = neighbor[h_idx].trips[t1_idx].drops[d1_idx];
+            const Drop& orig_drop2 = neighbor[h_idx].trips[t2_idx].drops[d2_idx];
+            int v1 = orig_drop1.village_id;
+            int v2 = orig_drop2.village_id;
+            // Save old distances
+            double old_dist1 = compute_trip_distance(neighbor[h_idx].trips[t1_idx], helicopter.home_city_id, problem, distances);
+            double old_dist2 = compute_trip_distance(neighbor[h_idx].trips[t2_idx], helicopter.home_city_id, problem, distances);
+            // Perform swap
             std::swap(neighbor[h_idx].trips[t1_idx].drops[d1_idx], neighbor[h_idx].trips[t2_idx].drops[d2_idx]);
             // Update pickups
-            for (auto& trip_ref : {std::ref(neighbor[h_idx].trips[t1_idx]), std::ref(neighbor[h_idx].trips[t2_idx])}) {
-                Trip& t = trip_ref.get();
-                t.dry_food_pickup = 0;
-                t.perishable_food_pickup = 0;
-                t.other_supplies_pickup = 0;
-                for (const auto& drop : t.drops) {
-                    t.dry_food_pickup += drop.dry_food;
-                    t.perishable_food_pickup += drop.perishable_food;
-                    t.other_supplies_pickup += drop.other_supplies;
+            auto& t1 = neighbor[h_idx].trips[t1_idx];
+            auto& t2 = neighbor[h_idx].trips[t2_idx];
+            t1.dry_food_pickup = 0;
+            t1.perishable_food_pickup = 0;
+            t1.other_supplies_pickup = 0;
+            for (const auto& drop : t1.drops) {
+                t1.dry_food_pickup += drop.dry_food;
+                t1.perishable_food_pickup += drop.perishable_food;
+                t1.other_supplies_pickup += drop.other_supplies;
+            }
+            t2.dry_food_pickup = 0;
+            t2.perishable_food_pickup = 0;
+            t2.other_supplies_pickup = 0;
+            for (const auto& drop : t2.drops) {
+                t2.dry_food_pickup += drop.dry_food;
+                t2.perishable_food_pickup += drop.perishable_food;
+                t2.other_supplies_pickup += drop.other_supplies;
+            }
+            // Check feasibility
+            double new_dist1 = compute_trip_distance(t1, helicopter.home_city_id, problem, distances);
+            double new_dist2 = compute_trip_distance(t2, helicopter.home_city_id, problem, distances);
+            double new_weight1 = compute_trip_weight(t1, problem);
+            double new_weight2 = compute_trip_weight(t2, problem);
+            double new_total_dist = total_dist - old_dist1 - old_dist2 + new_dist1 + new_dist2;
+            bool feasible = (new_weight1 <= helicopter.weight_capacity + 1e-9) &&
+                            (new_weight2 <= helicopter.weight_capacity + 1e-9) &&
+                            (new_dist1 <= helicopter.distance_capacity + 1e-9) &&
+                            (new_dist2 <= helicopter.distance_capacity + 1e-9) &&
+                            (new_total_dist <= problem.d_max + 1e-9);
+            if (!feasible) {
+                // Revert swap
+                std::swap(neighbor[h_idx].trips[t1_idx].drops[d1_idx], neighbor[h_idx].trips[t2_idx].drops[d2_idx]);
+                // Revert pickups
+                t1.dry_food_pickup = 0;
+                t1.perishable_food_pickup = 0;
+                t1.other_supplies_pickup = 0;
+                for (const auto& drop : t1.drops) {
+                    t1.dry_food_pickup += drop.dry_food;
+                    t1.perishable_food_pickup += drop.perishable_food;
+                    t1.other_supplies_pickup += drop.other_supplies;
+                }
+                t2.dry_food_pickup = 0;
+                t2.perishable_food_pickup = 0;
+                t2.other_supplies_pickup = 0;
+                for (const auto& drop : t2.drops) {
+                    t2.dry_food_pickup += drop.dry_food;
+                    t2.perishable_food_pickup += drop.perishable_food;
+                    t2.other_supplies_pickup += drop.other_supplies;
                 }
             }
+            // No demand update needed for swap as total deliveries to villages remain the same
         }
     }
 
@@ -488,6 +581,7 @@ Solution solve(const ProblemData& problem) {
         village_demand[i].meals_needed = 9 * problem.villages[i].population;
         village_demand[i].other_needed = problem.villages[i].population;
     }
+    auto initial_demand = village_demand;  // Copy for restarts
 
     // Compute distance matrix
     if (problem.cities.empty() || problem.villages.empty()) {
@@ -514,6 +608,7 @@ Solution solve(const ProblemData& problem) {
 
     // Initialize best solution with greedy solution
     Solution best_solution;
+    village_demand = initial_demand;  // Reset for greedy
     for (const auto& helicopter : problem.helicopters) {
         HelicopterPlan plan;
         plan.helicopter_id = helicopter.id;
@@ -523,7 +618,7 @@ Solution solve(const ProblemData& problem) {
             Trip trip = create_greedy_trip(helicopter, village_demand, problem, distances);
             if (trip.drops.empty()) break;
             double trip_dist = compute_trip_distance(trip, helicopter.home_city_id, problem, distances);
-            if (trip_dist > remaining_distance || trip_dist <= 0) break;
+            if (trip_dist > remaining_distance + 1e-9 || trip_dist <= 0) break;
             plan.trips.push_back(trip);
             remaining_distance -= trip_dist;
         }
@@ -544,7 +639,7 @@ Solution solve(const ProblemData& problem) {
         double elapsed_minutes = std::chrono::duration<double>(current_time - start_time).count() / 60.0;
         if (elapsed_minutes >= problem.time_limit_minutes * 0.95) break;
 
-        std::vector<VillageDemand> current_demand = village_demand;
+        std::vector<VillageDemand> current_demand = initial_demand;  // Reset to full demand
         Solution current_solution = generate_random_solution(problem, rng, current_demand, distances);
         double current_value = compute_objective(current_solution, problem, distances);
         cout << "Restart " << restart + 1 << " initial value: " << current_value << endl;
@@ -570,7 +665,6 @@ Solution solve(const ProblemData& problem) {
 
             if (current_value > best_value) {
                 best_solution = current_solution;
-                village_demand = current_demand;
                 best_value = current_value;
                 cout << "New best value at restart " << restart + 1 << ": " << best_value << endl;
             }
@@ -578,6 +672,42 @@ Solution solve(const ProblemData& problem) {
         }
     }
 
+    // Clean the best solution to remove any potentially invalid trips
+    for (auto& plan : best_solution) {
+        if (plan.helicopter_id < 1 || plan.helicopter_id > static_cast<int>(problem.helicopters.size())) {
+            plan.trips.clear();
+            continue;
+        }
+        const auto& helicopter = problem.helicopters[plan.helicopter_id - 1];
+        std::vector<Trip> valid_trips;
+        double heli_dist = 0.0;
+        for (const auto& trip : plan.trips) {
+            double t_dist = compute_trip_distance(trip, helicopter.home_city_id, problem, distances);
+            double t_weight = compute_trip_weight(trip, problem);
+            if (t_dist > 0 && t_dist <= helicopter.distance_capacity + 1e-9 && t_weight <= helicopter.weight_capacity + 1e-9) {
+                valid_trips.push_back(trip);
+                heli_dist += t_dist;
+            }
+        }
+        // If total exceeds d_max, remove trips starting from the longest until feasible
+        while (heli_dist > problem.d_max + 1e-9 && !valid_trips.empty()) {
+            // Find the longest trip
+            size_t max_idx = 0;
+            double max_d = 0.0;
+            for (size_t k = 0; k < valid_trips.size(); ++k) {
+                double td = compute_trip_distance(valid_trips[k], helicopter.home_city_id, problem, distances);
+                if (td > max_d) {
+                    max_d = td;
+                    max_idx = k;
+                }
+            }
+            valid_trips.erase(valid_trips.begin() + max_idx);
+            heli_dist -= max_d;
+        }
+        plan.trips = valid_trips;
+    }
+
+    best_value = compute_objective(best_solution, problem, distances);
     cout << "Solver finished. Best value: " << best_value << endl;
     return best_solution;
 }
