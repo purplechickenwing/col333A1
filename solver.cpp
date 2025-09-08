@@ -434,7 +434,49 @@ Solution solve(const ProblemData& problem) {
     cout << "Starting solver..." << endl;
 
     // Input validation
-    // (same as before)
+    if (problem.time_limit_minutes < 0) {
+        cerr << "Error: Negative time limit" << endl;
+        return Solution();
+    }
+    if (problem.d_max < 0) {
+        cerr << "Error: Negative d_max" << endl;
+        return Solution();
+    }
+    if (problem.packages.size() != 3) {
+        cerr << "Error: Exactly 3 package types required" << endl;
+        return Solution();
+    }
+    for (const auto& pkg : problem.packages) {
+        if (pkg.weight <= 0 || pkg.value < 0) {
+            cerr << "Error: Invalid package weight or value" << endl;
+            return Solution();
+        }
+    }
+    if (problem.villages.empty()) {
+        cerr << "Error: No villages provided" << endl;
+        return Solution();
+    }
+    for (const auto& village : problem.villages) {
+        if (village.id < 1 || village.id > static_cast<int>(problem.villages.size()) || 
+            village.population < 0) {
+            cerr << "Error: Invalid village ID or population" << endl;
+            return Solution();
+        }
+    }
+    if (problem.helicopters.empty()) {
+        cerr << "Error: No helicopters provided" << endl;
+        return Solution();
+    }
+    for (const auto& helicopter : problem.helicopters) {
+        if (helicopter.id < 1 || helicopter.id > static_cast<int>(problem.helicopters.size()) ||
+            helicopter.home_city_id < 1 || 
+            helicopter.home_city_id > static_cast<int>(problem.cities.size()) ||
+            helicopter.weight_capacity <= 0 || helicopter.distance_capacity <= 0 ||
+            helicopter.fixed_cost < 0 || helicopter.alpha < 0) {
+            cerr << "Error: Invalid helicopter parameters" << endl;
+            return Solution();
+        }
+    }
 
     // Initialize random number generator
     std::random_device rd;
@@ -490,8 +532,51 @@ Solution solve(const ProblemData& problem) {
     double best_value = compute_objective(best_solution, problem, distances);
     cout << "Initial greedy value: " << best_value << endl;
 
-    // Random restarts
-    // (same as before, with the updated generate_random_solution using the optimal allocate_packages)
+    // Random restarts parameters
+    const int max_restarts = 10;
+    const int max_iterations_per_restart = 100;
+    double time_limit_per_restart = problem.time_limit_minutes * 0.95 / max_restarts;
+
+    // Hill climbing with random restarts
+    auto start_time = std::chrono::steady_clock::now();
+    for (int restart = 0; restart < max_restarts; ++restart) {
+        auto current_time = std::chrono::steady_clock::now();
+        double elapsed_minutes = std::chrono::duration<double>(current_time - start_time).count() / 60.0;
+        if (elapsed_minutes >= problem.time_limit_minutes * 0.95) break;
+
+        std::vector<VillageDemand> current_demand = village_demand;
+        Solution current_solution = generate_random_solution(problem, rng, current_demand, distances);
+        double current_value = compute_objective(current_solution, problem, distances);
+        cout << "Restart " << restart + 1 << " initial value: " << current_value << endl;
+
+        int iteration = 0;
+        auto restart_start_time = std::chrono::steady_clock::now();
+        while (iteration < max_iterations_per_restart) {
+            auto iter_time = std::chrono::steady_clock::now();
+            double iter_elapsed = std::chrono::duration<double>(iter_time - restart_start_time).count() / 60.0;
+            if (iter_elapsed >= time_limit_per_restart || 
+                elapsed_minutes + iter_elapsed >= problem.time_limit_minutes * 0.95) {
+                break;
+            }
+
+            auto neighbor_demand = current_demand;
+            Solution neighbor = generate_neighbor(current_solution, neighbor_demand, problem, rng, distances);
+            double neighbor_value = compute_objective(neighbor, problem, distances);
+            if (neighbor_value > current_value) {
+                current_solution = neighbor;
+                current_demand = neighbor_demand;
+                current_value = neighbor_value;
+            }
+
+            if (current_value > best_value) {
+                best_solution = current_solution;
+                village_demand = current_demand;
+                best_value = current_value;
+                cout << "New best value at restart " << restart + 1 << ": " << best_value << endl;
+            }
+            ++iteration;
+        }
+    }
 
     cout << "Solver finished. Best value: " << best_value << endl;
     return best_solution;
